@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# Variablen
+REMOTE_USER="martin"
+REMOTE_HOST="192.168.178.128"
+LOGFILE="/mnt/user/42/log/log.log"
+ZFS_PATH="mcraspi/vm"
+SCREEN="mcraspi"
+SLEEP="3"
+SNAPSHOT_PREFIX="5MIN-autosnap"
+RETENTION_HOURS=6  # Retention in Stunden
+
+# Funktion zum Schreiben in die Logdatei
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"
+}
+
+#################################################################################################################### Poste per SSH in den mcraspi screen: /save all, /dynmap pause all
+
+log_message "####################################################################################################################"
+log_message "mcraspi_$SNAPSHOT_PREFIX script gestartet. Verbindung zu Remote-Host: $REMOTE_USER@$REMOTE_HOST"
+# SSH-Verbindung testen
+if ! ssh -o ConnectTimeout=10 -o BatchMode=yes -q "$REMOTE_USER@$REMOTE_HOST" exit; then
+    log_message "FEHLER: Verbindung zu $REMOTE_USER@$REMOTE_HOST fehlgeschlagen. Skript wird abgebrochen."
+    exit 1
+fi
+# SSH-Befehle senden
+log_message "Verbindung zu $REMOTE_USER@$REMOTE_HOST erfolgreich hergestellt."
+ssh -T "$REMOTE_USER@$REMOTE_HOST" << EOF
+screen -S $SCREEN -p 0 -X stuff "save-all$(printf \\r)"
+sleep $SLEEP
+screen -S $SCREEN -p 0 -X stuff "dynmap pause all$(printf \\r)"
+sleep $SLEEP
+EOF
+log_message "(/save all) und (/dynmap pause all) wurden erfolgreich per SSH an mcraspi VM übergeben."
+
+#################################################################################################################### erstelle und lösche Snapshots
+
+log_message "--------------------"
+log_message "--- ZFS Snapshot Skript gestartet ---"
+
+# Überprüfen, ob das ZFS-Dateisystem existiert
+if ! zfs list "$ZFS_PATH" >/dev/null 2>&1; then
+    log_message "FEHLER: Das ZFS-Dateisystem '$ZFS_PATH' existiert nicht. Abbruch."
+    exit 1
+fi
+
+# Erstellen eines neuen Snapshots
+SNAPSHOT_NAME="${ZFS_PATH}@${SNAPSHOT_PREFIX}_$(date '+%Y-%m-%d_%H-%M-%S')"
+if zfs snapshot "$SNAPSHOT_NAME"; then
+    log_message "Snapshot erfolgreich erstellt: $SNAPSHOT_NAME"
+else
+    log_message "FEHLER: Snapshot konnte nicht erstellt werden: $SNAPSHOT_NAME"
+    exit 1
+fi
+
+# Alte Snapshots bereinigen
+CURRENT_TIME=$(date +%s)
+RETENTION_SECONDS=$((RETENTION_HOURS * 3600))
+DELETED_SNAPSHOTS=0
+
+# Snapshots auflisten und bereinigen
+zfs list -t snapshot -o name | grep "${ZFS_PATH}@${SNAPSHOT_PREFIX}_" | while read -r SNAPSHOT; do
+    # Extrahiere Datum und Uhrzeit aus dem Snapshot-Namen
+    if [[ "$SNAPSHOT" =~ ${ZFS_PATH}@${SNAPSHOT_PREFIX}_([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2}-[0-9]{2}-[0-9]{2}) ]]; then
+        SNAPSHOT_DATE="${BASH_REMATCH[1]} ${BASH_REMATCH[2]//-/:}"
+
+        # Konvertiere das Datum in UNIX-Zeit
+        SNAPSHOT_TIME=$(date -d "$SNAPSHOT_DATE" +%s 2>/dev/null)
+        if [[ $? -ne 0 ]]; then
+            continue
+        fi
+
+        # Berechne Alter des Snapshots in Sekunden
+        AGE_SECONDS=$((CURRENT_TIME - SNAPSHOT_TIME))
+
+        if [[ $AGE_SECONDS -gt $RETENTION_SECONDS ]]; then
+            if zfs destroy "$SNAPSHOT"; then
+                log_message "Snapshot entfernt: $SNAPSHOT (Alter: $((AGE_SECONDS / 3600)) Stunden)"
+                ((DELETED_SNAPSHOTS++))
+            fi
+        fi
+    fi
+done
+
+if [[ $DELETED_SNAPSHOTS -eq 0 ]]; then
+    log_message "Keine alten Snapshots zum Löschen gefunden."
+fi
+
+log_message "--- ZFS Snapshot Skript beendet ---"
+sleep $SLEEP
+
+#################################################################################################################### Poste per SSH in den mcraspi screen: /dynmap pause none
+
+log_message "--------------------"
+# SSH-Verbindung testen
+if ! ssh -o ConnectTimeout=10 -o BatchMode=yes -q "$REMOTE_USER@$REMOTE_HOST" exit; then
+    log_message "FEHLER: Verbindung zu $REMOTE_USER@$REMOTE_HOST fehlgeschlagen. Skript wird abgebrochen."
+    exit 1
+fi
+# SSH-Befehle senden
+log_message "Verbindung zu $REMOTE_USER@$REMOTE_HOST erfolgreich hergestellt."
+ssh -T "$REMOTE_USER@$REMOTE_HOST" << EOF
+screen -S $SCREEN -p 0 -X stuff "dynmap pause none$(printf \\r)"
+sleep $SLEEP
+EOF
+log_message "(/dynmap pause none) wurde erfolgreich per SSH an mcraspi VM übergeben."
+log_message "mcraspi_$SNAPSHOT_PREFIX script erfolgrich ausgeführt und beendet"
+exit
